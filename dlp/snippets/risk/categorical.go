@@ -19,7 +19,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"time"
 
 	dlp "cloud.google.com/go/dlp/apiv2"
@@ -42,11 +41,11 @@ func riskCategorical(w io.Writer, projectID, dataProject, pubSubTopic, pubSubSub
 		return fmt.Errorf("dlp.NewClient: %v", err)
 	}
 	// Create a PubSub Client used to listen for when the inspect job finishes.
-	pClient, err := pubsub.NewClient(ctx, projectID)
+	pubsubClient, err := pubsub.NewClient(ctx, projectID)
 	if err != nil {
 		return fmt.Errorf("Error creating PubSub client: %v", err)
 	}
-	defer pClient.Close()
+	defer pubsubClient.Close()
 
 	// Create a PubSub subscription we can use to listen for messages.
 	s, err := setupPubSub(projectID, pubSubTopic, pubSubSub)
@@ -92,14 +91,17 @@ func riskCategorical(w io.Writer, projectID, dataProject, pubSubTopic, pubSubSub
 		},
 	}
 	// Create the risk job.
-	j, err := client.CreateDlpJob(context.Background(), req)
+	j, err := client.CreateDlpJob(ctx, req)
 	if err != nil {
 		return fmt.Errorf("CreateDlpJob: %v", err)
 	}
 	fmt.Fprintf(w, "Created job: %v\n", j.GetName())
 
 	// Wait for the risk job to finish by waiting for a PubSub message.
-	ctx, cancel := context.WithCancel(ctx)
+	// This only waits for 1 minute. For long jobs, consider using a truly
+	// asynchronous execution model such as Cloud Functions.
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+	defer cancel()
 	err = s.Receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
 		// If this is the wrong job, do not process the result.
 		if msg.Attributes["DlpJobName"] != j.GetName() {
@@ -112,7 +114,8 @@ func riskCategorical(w io.Writer, projectID, dataProject, pubSubTopic, pubSubSub
 			Name: j.GetName(),
 		})
 		if err != nil {
-			log.Fatalf("GetDlpJob: %v", err)
+			fmt.Fprintf(w, "GetDlpJob: %v", err)
+			return
 		}
 		h := resp.GetRiskDetails().GetCategoricalStatsResult().GetValueFrequencyHistogramBuckets()
 		for i, b := range h {
@@ -128,7 +131,7 @@ func riskCategorical(w io.Writer, projectID, dataProject, pubSubTopic, pubSubSub
 		cancel()
 	})
 	if err != nil {
-		return fmt.Errorf("Recieve: %v", err)
+		return fmt.Errorf("Receive: %v", err)
 	}
 	return nil
 }
